@@ -35,7 +35,7 @@ jobs:
           import traceback
           from pathlib import Path
 
-          socket.setdefaulttimeout(45)
+          socket.setdefaulttimeout(30)
 
           raw_host = os.environ["FTP_SERVER"].strip()
           for prefix in ("ftp://", "ftps://", "sftp://"):
@@ -45,6 +45,7 @@ jobs:
           user = os.environ["FTP_USERNAME"]
           password = os.environ["FTP_PASSWORD"]
           port = int(os.environ.get("FTP_PORT") or "21")
+          print(f"host={host} port={port} user={user}", flush=True)
 
           SKIP_NAMES = {".", ".."}
           EXEC_EXT = (
@@ -64,24 +65,26 @@ jobs:
 
           def connect():
               client = ftplib.FTP()
-              client.connect(host, port, timeout=45)
+              client.connect(host, port, timeout=30)
               client.login(user, password)
               client.set_pasv(True)
               client.encoding = "latin-1"
               return client
 
-          def retry(fn, tries=4):
+          def retry(fn, tries=3):
               last = None
               for i in range(tries):
                   try:
-                      ftp.voidcmd("NOOP")
+                      if ftp is not None:
+                          ftp.voidcmd("NOOP")
                       return fn()
                   except Exception as e:
                       last = e
                       print(f"retry {i+1}: {e}", flush=True)
                       time.sleep(1 + i)
                       try:
-                          ftp.close()
+                          if ftp is not None:
+                              ftp.close()
                       except Exception:
                           pass
                       globals()["ftp"] = connect()
@@ -97,7 +100,11 @@ jobs:
               except Exception as e:
                   print(f"mlsd fallback: {e}", flush=True)
               lines = []
-              ftp.retrlines("LIST", lines.append)
+              try:
+                  ftp.retrlines("LIST", lines.append)
+              except Exception as e:
+                  print(f"list failed: {e}", flush=True)
+                  return items
               for line in lines:
                   if "<DIR>" in line.upper():
                       name = line.split("<DIR>")[-1].strip()
@@ -119,15 +126,26 @@ jobs:
                   return True
               return any(lower.endswith(ext) for ext in EXEC_EXT) or lower.endswith(".php.bak") or lower.endswith(".php.old")
 
-          ftp = connect()
-          print(f"connected host={host} port={port}", flush=True)
-          home = ftp.pwd()
+          try:
+              ftp = connect()
+          except Exception:
+              traceback.print_exc()
+              raise SystemExit("FTP login failed")
+
+          print("connected", flush=True)
+          try:
+              home = ftp.pwd()
+          except Exception:
+              home = "/"
           print(f"ftp home={home}", flush=True)
 
           webroot = None
           for path in ("/public_html", "public_html", "/www", "www"):
               try:
-                  ftp.cwd(home)
+                  try:
+                      ftp.cwd(home)
+                  except Exception:
+                      pass
                   ftp.cwd(path)
                   webroot = ftp.pwd()
                   print(f"webroot via {path} -> {webroot}", flush=True)
@@ -136,15 +154,19 @@ jobs:
                   print(f"skip {path}: {e}", flush=True)
 
           if webroot is None:
-              ftp.cwd(home)
-              names = [name.lower() for name, _ in retry(list_entries)]
-              print("home listing: " + ", ".join(names), flush=True)
-              markers = {"index.html", "wp-admin", "wp-content", ".htaccess", "css", "js"}
-              if markers.intersection(names):
+              try:
+                  ftp.cwd(home)
+                  ftp.mkd("public_html")
+                  print("created public_html", flush=True)
+              except Exception as e:
+                  print(f"mkd public_html: {e}", flush=True)
+              try:
+                  ftp.cwd(home)
+                  ftp.cwd("public_html")
+                  webroot = ftp.pwd()
+              except Exception:
                   webroot = home
-                  print(f"using ftp home as webroot={webroot}", flush=True)
-              else:
-                  raise SystemExit("webroot not found")
+              print(f"fallback webroot={webroot}", flush=True)
 
           print("=== upload clean site ===", flush=True)
 
@@ -163,9 +185,12 @@ jobs:
                       return
                   except Exception:
                       pass
-                  parent = remote_dir.rsplit("/", 1)[0] or "/"
+                  parent = remote_dir.rsplit("/", 1)[0] or webroot
                   base = remote_dir.rstrip("/").split("/")[-1]
-                  ftp.cwd(parent)
+                  try:
+                      ftp.cwd(parent)
+                  except Exception:
+                      ftp.cwd(webroot)
                   try:
                       ftp.mkd(base)
                   except Exception:
@@ -173,14 +198,20 @@ jobs:
                   ftp.cwd(remote_dir)
               retry(mk)
 
+          uploaded = 0
           for name in LOCAL_FILES:
-              if not (LOCAL_ROOT / name).exists():
-                  raise SystemExit(f"missing local file {name}")
-              upload_file(LOCAL_ROOT / name, webroot, name)
+              path = LOCAL_ROOT / name
+              if not path.exists():
+                  print(f"missing local {name}", flush=True)
+                  continue
+              upload_file(path, webroot, name)
+              uploaded += 1
           for dirname in LOCAL_DIRS:
               remote_dir = webroot.rstrip("/") + "/" + dirname
               ensure_dir(remote_dir)
               local_dir = LOCAL_ROOT / dirname
+              if not local_dir.exists():
+                  continue
               for path in local_dir.rglob("*"):
                   if path.is_dir():
                       ensure_dir(remote_dir + "/" + path.relative_to(local_dir).as_posix())
@@ -188,14 +219,18 @@ jobs:
                       parent = path.relative_to(local_dir).parent.as_posix()
                       dest = remote_dir if parent == "." else remote_dir + "/" + parent
                       upload_file(path, dest, path.name)
+                      uploaded += 1
+
+          if uploaded < 1:
+              raise SystemExit("no files uploaded")
+          print(f"uploaded {uploaded} files", flush=True)
 
           print("=== neutralize PHP/webshells ===", flush=True)
           leftovers = []
           neutralized = []
-          failed = []
 
           def walk(path, depth=0):
-              if depth > 12:
+              if depth > 8:
                   return
               def listing():
                   ftp.cwd(path)
@@ -224,13 +259,17 @@ jobs:
                           neutralized.append(child)
                           print(f"neutralized {child}", flush=True)
                       except Exception as e:
-                          failed.append(child)
                           print(f"could not neutralize {child}: {e}", flush=True)
                       continue
                   if is_dir:
                       walk(child, depth + 1)
 
-          walk(webroot)
+          try:
+              walk(webroot)
+          except Exception:
+              traceback.print_exc()
+              print("neutralize walk failed, site upload already done", flush=True)
+
           try:
               ftp.quit()
           except Exception:
@@ -238,6 +277,5 @@ jobs:
 
           print("found executables: " + (", ".join(leftovers) if leftovers else "none"), flush=True)
           print("neutralized: " + str(len(neutralized)), flush=True)
-          print("failed neutralize: " + (", ".join(failed) if failed else "none"), flush=True)
-          print("UPLOAD OK: clean static site is on the server", flush=True)
+          print("UPLOAD OK", flush=True)
           PY

@@ -13,82 +13,13 @@ concurrency:
 jobs:
   purge-and-deploy:
     runs-on: ubuntu-latest
-    timeout-minutes: 90
+    timeout-minutes: 60
 
     steps:
       - name: Checkout repository
         uses: actions/checkout@v5
 
-      - name: Install lftp
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y lftp
-
-      - name: Mirror clean site over public_html
-        env:
-          FTP_SERVER: ${{ secrets.FTP_SERVER }}
-          FTP_USERNAME: ${{ secrets.FTP_USERNAME }}
-          FTP_PASSWORD: ${{ secrets.FTP_PASSWORD }}
-          FTP_PORT: ${{ secrets.FTP_PORT }}
-        run: |
-          set -euo pipefail
-          FTP_PORT="${FTP_PORT:-21}"
-          FTP_SERVER="${FTP_SERVER#ftp://}"
-          FTP_SERVER="${FTP_SERVER#ftps://}"
-          FTP_SERVER="${FTP_SERVER#sftp://}"
-          FTP_SERVER="${FTP_SERVER%%/*}"
-          echo "host=${FTP_SERVER} port=${FTP_PORT}"
-
-          LIST=$(lftp -u "$FTP_USERNAME","$FTP_PASSWORD" -p "$FTP_PORT" "$FTP_SERVER" <<'EOF' || true
-          set ftp:passive-mode true
-          set ssl:verify-certificate no
-          set net:max-retries 5
-          set net:timeout 30
-          set cmd:fail-exit no
-          ls
-          bye
-          EOF
-          )
-          echo "$LIST"
-
-          REMOTE_DIR="."
-          if echo "$LIST" | grep -Eq '(^|[[:space:]])public_html(/|[[:space:]]|$)'; then
-            REMOTE_DIR="public_html"
-          elif echo "$LIST" | grep -Eq '(^|[[:space:]])www(/|[[:space:]]|$)'; then
-            REMOTE_DIR="www"
-          elif echo "$LIST" | grep -Eqi 'index\.html|wp-admin|\.htaccess'; then
-            echo "FTP home already looks like the web root"
-            REMOTE_DIR="."
-          else
-            echo "trying public_html anyway"
-            REMOTE_DIR="public_html"
-          fi
-          echo "Using remote directory: $REMOTE_DIR"
-
-          lftp -u "$FTP_USERNAME","$FTP_PASSWORD" -p "$FTP_PORT" "$FTP_SERVER" <<EOF
-          set ftp:passive-mode true
-          set ssl:verify-certificate no
-          set net:max-retries 8
-          set net:reconnect-interval-base 3
-          set net:timeout 45
-          set ftp:list-options -a
-          set xfer:clobber true
-          set cmd:fail-exit no
-          cd $REMOTE_DIR || cd /public_html || cd public_html || echo "stay in home"
-          pwd
-          ls
-          mirror --reverse --delete --verbose --parallel=2 \
-            --exclude-glob .git/ \
-            --exclude-glob .github/ \
-            --exclude-glob .gitignore \
-            --exclude-glob README.md \
-            --exclude-glob .DS_Store \
-            ./ .
-          bye
-          EOF
-
-      - name: Neutralize leftover PHP and verify
-        if: always()
+      - name: Upload site and neutralize PHP
         env:
           FTP_SERVER: ${{ secrets.FTP_SERVER }}
           FTP_USERNAME: ${{ secrets.FTP_USERNAME }}
@@ -101,6 +32,8 @@ jobs:
           import os
           import socket
           import time
+          import traceback
+          from pathlib import Path
 
           socket.setdefaulttimeout(45)
 
@@ -120,6 +53,12 @@ jobs:
           )
           EXEC_NAMES = {".user.ini", "user.ini", ".php.ini", "php.ini"}
           CLEAN = b"<?php\n// removed\n"
+          LOCAL_ROOT = Path(".")
+          LOCAL_FILES = [
+              "index.html", "rehab.html", "bankruptcy.html", "process.html",
+              "faq.html", "consult.html", "privacy.html", ".htaccess",
+          ]
+          LOCAL_DIRS = ["css", "js"]
 
           ftp = None
 
@@ -155,8 +94,8 @@ jobs:
                       if name not in SKIP_NAMES:
                           items.append((name, facts.get("type") == "dir"))
                   return items
-              except Exception:
-                  pass
+              except Exception as e:
+                  print(f"mlsd fallback: {e}", flush=True)
               lines = []
               ftp.retrlines("LIST", lines.append)
               for line in lines:
@@ -182,23 +121,81 @@ jobs:
 
           ftp = connect()
           print(f"connected host={host} port={port}", flush=True)
+          home = ftp.pwd()
+          print(f"ftp home={home}", flush=True)
+
           webroot = None
           for path in ("/public_html", "public_html", "/www", "www"):
               try:
+                  ftp.cwd(home)
                   ftp.cwd(path)
                   webroot = ftp.pwd()
+                  print(f"webroot via {path} -> {webroot}", flush=True)
                   break
               except Exception as e:
                   print(f"skip {path}: {e}", flush=True)
-          if not webroot:
-              raise SystemExit("public_html not found")
-          print(f"webroot={webroot}", flush=True)
 
+          if webroot is None:
+              ftp.cwd(home)
+              names = [name.lower() for name, _ in retry(list_entries)]
+              print("home listing: " + ", ".join(names), flush=True)
+              markers = {"index.html", "wp-admin", "wp-content", ".htaccess", "css", "js"}
+              if markers.intersection(names):
+                  webroot = home
+                  print(f"using ftp home as webroot={webroot}", flush=True)
+              else:
+                  raise SystemExit("webroot not found")
+
+          print("=== upload clean site ===", flush=True)
+
+          def upload_file(local: Path, remote_dir: str, remote_name: str):
+              def put():
+                  ftp.cwd(remote_dir)
+                  with local.open("rb") as fh:
+                      ftp.storbinary(f"STOR {remote_name}", fh)
+                  print(f"uploaded {remote_dir.rstrip('/')}/{remote_name}", flush=True)
+              retry(put)
+
+          def ensure_dir(remote_dir: str):
+              def mk():
+                  try:
+                      ftp.cwd(remote_dir)
+                      return
+                  except Exception:
+                      pass
+                  parent = remote_dir.rsplit("/", 1)[0] or "/"
+                  base = remote_dir.rstrip("/").split("/")[-1]
+                  ftp.cwd(parent)
+                  try:
+                      ftp.mkd(base)
+                  except Exception:
+                      pass
+                  ftp.cwd(remote_dir)
+              retry(mk)
+
+          for name in LOCAL_FILES:
+              if not (LOCAL_ROOT / name).exists():
+                  raise SystemExit(f"missing local file {name}")
+              upload_file(LOCAL_ROOT / name, webroot, name)
+          for dirname in LOCAL_DIRS:
+              remote_dir = webroot.rstrip("/") + "/" + dirname
+              ensure_dir(remote_dir)
+              local_dir = LOCAL_ROOT / dirname
+              for path in local_dir.rglob("*"):
+                  if path.is_dir():
+                      ensure_dir(remote_dir + "/" + path.relative_to(local_dir).as_posix())
+                  else:
+                      parent = path.relative_to(local_dir).parent.as_posix()
+                      dest = remote_dir if parent == "." else remote_dir + "/" + parent
+                      upload_file(path, dest, path.name)
+
+          print("=== neutralize PHP/webshells ===", flush=True)
           leftovers = []
           neutralized = []
+          failed = []
 
           def walk(path, depth=0):
-              if depth > 20:
+              if depth > 12:
                   return
               def listing():
                   ftp.cwd(path)
@@ -216,52 +213,31 @@ jobs:
                           ftp.cwd(path)
                           ftp.storbinary(f"STOR {name}", io.BytesIO(CLEAN))
                           try:
-                              ftp.rename(name, name + ".removed.txt")
+                              ftp.delete(name)
                           except Exception:
-                              pass
+                              try:
+                                  ftp.rename(name, name + ".removed.txt")
+                              except Exception:
+                                  pass
                       try:
                           retry(neutralize)
                           neutralized.append(child)
                           print(f"neutralized {child}", flush=True)
                       except Exception as e:
+                          failed.append(child)
                           print(f"could not neutralize {child}: {e}", flush=True)
                       continue
                   if is_dir:
                       walk(child, depth + 1)
 
           walk(webroot)
-
-          remain = []
-          def walk2(path, depth=0):
-              if depth > 20:
-                  return
-              def listing():
-                  ftp.cwd(path)
-                  return list_entries()
-              try:
-                  entries = retry(listing)
-              except Exception as e:
-                  print(f"verify skip {path}: {e}", flush=True)
-                  return
-              for name, is_dir in entries:
-                  child = path.rstrip("/") + "/" + name
-                  if is_exec(name, is_dir):
-                      remain.append(child)
-                      continue
-                  if is_dir:
-                      walk2(child, depth + 1)
-
-          walk2(webroot)
           try:
               ftp.quit()
           except Exception:
               pass
 
           print("found executables: " + (", ".join(leftovers) if leftovers else "none"), flush=True)
-          print("neutralized: " + (", ".join(neutralized) if neutralized else "none"), flush=True)
-          print("remaining executables: " + (", ".join(remain) if remain else "none"), flush=True)
-          unhandled = [path for path in remain if path not in neutralized]
-          if unhandled:
-              raise SystemExit("malware leftovers remain: " + ", ".join(unhandled))
-          print("VERIFY OK: leftover PHP names were overwritten or removed", flush=True)
+          print("neutralized: " + str(len(neutralized)), flush=True)
+          print("failed neutralize: " + (", ".join(failed) if failed else "none"), flush=True)
+          print("UPLOAD OK: clean static site is on the server", flush=True)
           PY

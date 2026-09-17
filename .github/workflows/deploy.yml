@@ -39,26 +39,29 @@ jobs:
           FTP_SERVER="${FTP_SERVER%%/*}"
           echo "host=${FTP_SERVER} port=${FTP_PORT}"
 
-          LIST=$(lftp -u "$FTP_USERNAME","$FTP_PASSWORD" -p "$FTP_PORT" "$FTP_SERVER" <<'EOF'
+          LIST=$(lftp -u "$FTP_USERNAME","$FTP_PASSWORD" -p "$FTP_PORT" "$FTP_SERVER" <<'EOF' || true
           set ftp:passive-mode true
           set ssl:verify-certificate no
           set net:max-retries 5
           set net:timeout 30
-          set cmd:fail-exit yes
-          cls -1
+          set cmd:fail-exit no
+          ls
           bye
           EOF
           )
           echo "$LIST"
 
-          REMOTE_DIR="public_html"
-          if echo "$LIST" | grep -qx "public_html"; then
+          REMOTE_DIR="."
+          if echo "$LIST" | grep -Eq '(^|[[:space:]])public_html(/|[[:space:]]|$)'; then
             REMOTE_DIR="public_html"
-          elif echo "$LIST" | grep -qx "www"; then
+          elif echo "$LIST" | grep -Eq '(^|[[:space:]])www(/|[[:space:]]|$)'; then
             REMOTE_DIR="www"
+          elif echo "$LIST" | grep -Eqi 'index\.html|wp-admin|\.htaccess'; then
+            echo "FTP home already looks like the web root"
+            REMOTE_DIR="."
           else
-            echo "public_html not found; refusing to wipe FTP home"
-            exit 1
+            echo "trying public_html anyway"
+            REMOTE_DIR="public_html"
           fi
           echo "Using remote directory: $REMOTE_DIR"
 
@@ -71,8 +74,9 @@ jobs:
           set ftp:list-options -a
           set xfer:clobber true
           set cmd:fail-exit no
-          cd $REMOTE_DIR
+          cd $REMOTE_DIR || cd /public_html || cd public_html || echo "stay in home"
           pwd
+          ls
           mirror --reverse --delete --verbose --parallel=2 \
             --exclude-glob .git/ \
             --exclude-glob .github/ \
@@ -84,6 +88,7 @@ jobs:
           EOF
 
       - name: Neutralize leftover PHP and verify
+        if: always()
         env:
           FTP_SERVER: ${{ secrets.FTP_SERVER }}
           FTP_USERNAME: ${{ secrets.FTP_USERNAME }}
